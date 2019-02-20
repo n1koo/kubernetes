@@ -38,6 +38,11 @@ const TagNameKubernetesClusterPrefix = "kubernetes.io/cluster/"
 // did not allow shared resources.
 const TagNameKubernetesClusterLegacy = "KubernetesCluster"
 
+// TagNameKubernetesNodeNamePrefix is the tag name we use to allow administrators
+// to override the nodeName of the EC2 instance. This is useful in situations
+// when the VPC might be using custom DHCP or a private route53 zone hostname schema.
+const TagNameKubernetesNodeNamePrefix = "kubernetes.io/nodeName"
+
 // ResourceLifecycle is the cluster lifecycle state used in tagging
 type ResourceLifecycle string
 

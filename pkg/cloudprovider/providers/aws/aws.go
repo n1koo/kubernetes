@@ -57,7 +57,7 @@ import (
 	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/pkg/version"
 	"k8s.io/client-go/tools/record"
-	"k8s.io/cloud-provider"
+	cloudprovider "k8s.io/cloud-provider"
 	nodehelpers "k8s.io/cloud-provider/node/helpers"
 	servicehelpers "k8s.io/cloud-provider/service/helpers"
 	cloudvolume "k8s.io/cloud-provider/volume"
@@ -259,6 +259,9 @@ const MaxReadThenCreateRetries = 30
 // TODO: Remove when user/admin can configure volume types and thus we don't
 // need hardcoded defaults.
 const DefaultVolumeType = "gp2"
+
+// Used to call recognizeWellKnownRegions just once
+var once sync.Once
 
 // Services is an abstraction over AWS, to allow mocking/other implementations
 type Services interface {
@@ -907,28 +910,12 @@ func (s *awsSdkEC2) DescribeInstances(request *ec2.DescribeInstancesInput) ([]*e
 
 // Implements EC2.DescribeSecurityGroups
 func (s *awsSdkEC2) DescribeSecurityGroups(request *ec2.DescribeSecurityGroupsInput) ([]*ec2.SecurityGroup, error) {
-	// Security groups are paged
-	results := []*ec2.SecurityGroup{}
-	var nextToken *string
-	requestTime := time.Now()
-	for {
-		response, err := s.ec2.DescribeSecurityGroups(request)
-		if err != nil {
-			recordAWSMetric("describe_security_groups", 0, err)
-			return nil, fmt.Errorf("error listing AWS security groups: %q", err)
-		}
-
-		results = append(results, response.SecurityGroups...)
-
-		nextToken = response.NextToken
-		if aws.StringValue(nextToken) == "" {
-			break
-		}
-		request.NextToken = nextToken
+	// Security groups are not paged
+	response, err := s.ec2.DescribeSecurityGroups(request)
+	if err != nil {
+		return nil, fmt.Errorf("error listing AWS security groups: %q", err)
 	}
-	timeTaken := time.Since(requestTime).Seconds()
-	recordAWSMetric("describe_security_groups", timeTaken, nil)
-	return results, nil
+	return response.SecurityGroups, nil
 }
 
 func (s *awsSdkEC2) AttachVolume(request *ec2.AttachVolumeInput) (*ec2.VolumeAttachment, error) {
@@ -1053,27 +1040,12 @@ func (s *awsSdkEC2) CreateTags(request *ec2.CreateTagsInput) (*ec2.CreateTagsOut
 }
 
 func (s *awsSdkEC2) DescribeRouteTables(request *ec2.DescribeRouteTablesInput) ([]*ec2.RouteTable, error) {
-	results := []*ec2.RouteTable{}
-	var nextToken *string
-	requestTime := time.Now()
-	for {
-		response, err := s.ec2.DescribeRouteTables(request)
-		if err != nil {
-			recordAWSMetric("describe_route_tables", 0, err)
-			return nil, fmt.Errorf("error listing AWS route tables: %q", err)
-		}
-
-		results = append(results, response.RouteTables...)
-
-		nextToken = response.NextToken
-		if aws.StringValue(nextToken) == "" {
-			break
-		}
-		request.NextToken = nextToken
+	// Not paged
+	response, err := s.ec2.DescribeRouteTables(request)
+	if err != nil {
+		return nil, fmt.Errorf("error listing AWS route tables: %q", err)
 	}
-	timeTaken := time.Since(requestTime).Seconds()
-	recordAWSMetric("describe_route_tables", timeTaken, nil)
-	return results, nil
+	return response.RouteTables, nil
 }
 
 func (s *awsSdkEC2) CreateRoute(request *ec2.CreateRouteInput) (*ec2.CreateRouteOutput, error) {
@@ -1207,8 +1179,14 @@ func newAWSCloud(cfg CloudConfig, awsServices Services) (*Cloud, error) {
 		return nil, err
 	}
 
+	// Trust that if we get a region from configuration or AWS metadata that it is valid,
+	// and register ECR providers
+	recognizeRegion(regionName)
+
 	if !cfg.Global.DisableStrictZoneCheck {
-		if !isRegionValid(regionName, metadata) {
+		valid := isRegionValid(regionName)
+		if !valid {
+			// This _should_ now be unreachable, given we call RecognizeRegion
 			return nil, fmt.Errorf("not a valid AWS zone (unknown region): %s", zone)
 		}
 	} else {
@@ -1290,41 +1268,12 @@ func newAWSCloud(cfg CloudConfig, awsServices Services) (*Cloud, error) {
 		}
 	}
 
+	// Register regions, in particular for ECR credentials
+	once.Do(func() {
+		recognizeWellKnownRegions()
+	})
+
 	return awsCloud, nil
-}
-
-// isRegionValid accepts an AWS region name and returns if the region is a
-// valid region known to the AWS SDK. Considers the region returned from the
-// EC2 metadata service to be a valid region as it's only available on a host
-// running in a valid AWS region.
-func isRegionValid(region string, metadata EC2Metadata) bool {
-	// Does the AWS SDK know about the region?
-	for _, p := range endpoints.DefaultPartitions() {
-		for r := range p.Regions() {
-			if r == region {
-				return true
-			}
-		}
-	}
-
-	// ap-northeast-3 is purposely excluded from the SDK because it
-	// requires an access request (for more details see):
-	// https://github.com/aws/aws-sdk-go/issues/1863
-	if region == "ap-northeast-3" {
-		return true
-	}
-
-	// Fallback to checking if the region matches the instance metadata region
-	// (ignoring any user overrides). This just accounts for running an old
-	// build of Kubernetes in a new region that wasn't compiled into the SDK
-	// when Kubernetes was built.
-	if az, err := getAvailabilityZone(metadata); err == nil {
-		if r, err := azToRegion(az); err == nil && region == r {
-			return true
-		}
-	}
-
-	return false
 }
 
 // Initialize passes a Kubernetes clientBuilder interface to the cloud provider
@@ -1408,17 +1357,14 @@ func (c *Cloud) NodeAddresses(ctx context.Context, name types.NodeName) ([]v1.No
 			addresses = append(addresses, v1.NodeAddress{Type: v1.NodeExternalIP, Address: externalIP})
 		}
 
-		localHostname, err := c.metadata.GetMetadata("local-hostname")
-		if err != nil || len(localHostname) == 0 {
+		internalDNS, err := c.metadata.GetMetadata("local-hostname")
+		if err != nil || len(internalDNS) == 0 {
 			//TODO: It would be nice to be able to determine the reason for the failure,
 			// but the AWS client masks all failures with the same error description.
 			klog.V(4).Info("Could not determine private DNS from AWS metadata.")
 		} else {
-			hostname, internalDNS := parseMetadataLocalHostname(localHostname)
-			addresses = append(addresses, v1.NodeAddress{Type: v1.NodeHostName, Address: hostname})
-			for _, d := range internalDNS {
-				addresses = append(addresses, v1.NodeAddress{Type: v1.NodeInternalDNS, Address: d})
-			}
+			addresses = append(addresses, v1.NodeAddress{Type: v1.NodeInternalDNS, Address: internalDNS})
+			addresses = append(addresses, v1.NodeAddress{Type: v1.NodeHostName, Address: internalDNS})
 		}
 
 		externalDNS, err := c.metadata.GetMetadata("public-hostname")
@@ -1438,26 +1384,6 @@ func (c *Cloud) NodeAddresses(ctx context.Context, name types.NodeName) ([]v1.No
 		return nil, fmt.Errorf("getInstanceByNodeName failed for %q with %q", name, err)
 	}
 	return extractNodeAddresses(instance)
-}
-
-// parseMetadataLocalHostname parses the output of "local-hostname" metadata.
-// If a DHCP option set is configured for a VPC and it has multiple domain names, GetMetadata
-// returns a string containing first the hostname followed by additional domain names,
-// space-separated. For example, if the DHCP option set has:
-// domain-name = us-west-2.compute.internal a.a b.b c.c d.d;
-// $ curl http://169.254.169.254/latest/meta-data/local-hostname
-// ip-192-168-111-51.us-west-2.compute.internal a.a b.b c.c d.d
-func parseMetadataLocalHostname(metadata string) (string, []string) {
-	localHostnames := strings.Fields(metadata)
-	hostname := localHostnames[0]
-	internalDNS := []string{hostname}
-
-	privateAddress := strings.Split(hostname, ".")[0]
-	for _, h := range localHostnames[1:] {
-		internalDNSAddress := privateAddress + "." + h
-		internalDNS = append(internalDNS, internalDNSAddress)
-	}
-	return hostname, internalDNS
 }
 
 // extractNodeAddresses maps the instance information from EC2 to an array of NodeAddresses
@@ -1653,30 +1579,11 @@ func (c *Cloud) GetCandidateZonesForDynamicVolume() (sets.String, error) {
 	// TODO: Caching / expose v1.Nodes to the cloud provider?
 	// TODO: We could also query for subnets, I think
 
-	// Note: It is more efficient to call the EC2 API twice with different tag
-	// filters than to call it once with a tag filter that results in a logical
-	// OR. For really large clusters the logical OR will result in EC2 API rate
-	// limiting.
-	instances := []*ec2.Instance{}
+	filters := []*ec2.Filter{newEc2Filter("instance-state-name", "running")}
 
-	baseFilters := []*ec2.Filter{newEc2Filter("instance-state-name", "running")}
-
-	filters := c.tagging.addFilters(baseFilters)
-	di, err := c.describeInstances(filters)
+	instances, err := c.describeInstances(filters)
 	if err != nil {
 		return nil, err
-	}
-
-	instances = append(instances, di...)
-
-	if c.tagging.usesLegacyTags {
-		filters = c.tagging.addLegacyFilters(baseFilters)
-		di, err = c.describeInstances(filters)
-		if err != nil {
-			return nil, err
-		}
-
-		instances = append(instances, di...)
 	}
 
 	if len(instances) == 0 {
@@ -2426,17 +2333,19 @@ func (c *Cloud) CreateDisk(volumeOptions *VolumeOptions) (KubernetesVolumeID, er
 	}
 	volumeName := KubernetesVolumeID("aws://" + aws.StringValue(response.AvailabilityZone) + "/" + string(awsID))
 
-	err = c.waitUntilVolumeAvailable(volumeName)
-	if err != nil {
-		// AWS has a bad habbit of reporting success when creating a volume with
-		// encryption keys that either don't exists or have wrong permissions.
-		// Such volume lives for couple of seconds and then it's silently deleted
-		// by AWS. There is no other check to ensure that given KMS key is correct,
-		// because Kubernetes may have limited permissions to the key.
-		if isAWSErrorVolumeNotFound(err) {
-			err = fmt.Errorf("failed to create encrypted volume: the volume disappeared after creation, most likely due to inaccessible KMS encryption key")
+	// AWS has a bad habbit of reporting success when creating a volume with
+	// encryption keys that either don't exists or have wrong permissions.
+	// Such volume lives for couple of seconds and then it's silently deleted
+	// by AWS. There is no other check to ensure that given KMS key is correct,
+	// because Kubernetes may have limited permissions to the key.
+	if len(volumeOptions.KmsKeyID) > 0 {
+		err := c.waitUntilVolumeAvailable(volumeName)
+		if err != nil {
+			if isAWSErrorVolumeNotFound(err) {
+				err = fmt.Errorf("failed to create encrypted volume: the volume disappeared after creation, most likely due to inaccessible KMS encryption key")
+			}
+			return "", err
 		}
-		return "", err
 	}
 
 	return volumeName, nil
@@ -3121,16 +3030,17 @@ func (c *Cloud) ensureSecurityGroup(name string, description string, additionalT
 	for {
 		attempt++
 
+		request := &ec2.DescribeSecurityGroupsInput{}
+		filters := []*ec2.Filter{
+			newEc2Filter("group-name", name),
+			newEc2Filter("vpc-id", c.vpcID),
+		}
 		// Note that we do _not_ add our tag filters; group-name + vpc-id is the EC2 primary key.
 		// However, we do check that it matches our tags.
 		// If it doesn't have any tags, we tag it; this is how we recover if we failed to tag before.
 		// If it has a different cluster's tags, that is an error.
 		// This shouldn't happen because name is expected to be globally unique (UUID derived)
-		request := &ec2.DescribeSecurityGroupsInput{}
-		request.Filters = []*ec2.Filter{
-			newEc2Filter("group-name", name),
-			newEc2Filter("vpc-id", c.vpcID),
-		}
+		request.Filters = filters
 
 		securityGroups, err := c.ec2.DescribeSecurityGroups(request)
 		if err != nil {
@@ -3206,7 +3116,8 @@ func findTag(tags []*ec2.Tag, key string) (string, bool) {
 // However, in future this will likely be treated as an error.
 func (c *Cloud) findSubnets() ([]*ec2.Subnet, error) {
 	request := &ec2.DescribeSubnetsInput{}
-	request.Filters = []*ec2.Filter{newEc2Filter("vpc-id", c.vpcID)}
+	filters := []*ec2.Filter{newEc2Filter("vpc-id", c.vpcID)}
+	request.Filters = c.tagging.addFilters(filters)
 
 	subnets, err := c.ec2.DescribeSubnets(request)
 	if err != nil {
@@ -3228,7 +3139,8 @@ func (c *Cloud) findSubnets() ([]*ec2.Subnet, error) {
 	klog.Warningf("No tagged subnets found; will fall-back to the current subnet only.  This is likely to be an error in a future version of k8s.")
 
 	request = &ec2.DescribeSubnetsInput{}
-	request.Filters = []*ec2.Filter{newEc2Filter("subnet-id", c.selfAWSInstance.subnetID)}
+	filters = []*ec2.Filter{newEc2Filter("subnet-id", c.selfAWSInstance.subnetID)}
+	request.Filters = filters
 
 	subnets, err = c.ec2.DescribeSubnets(request)
 	if err != nil {
@@ -3492,7 +3404,7 @@ func (c *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, apiS
 	listeners := []*elb.Listener{}
 	v2Mappings := []nlbPortMapping{}
 
-	sslPorts := getPortSets(annotations[ServiceAnnotationLoadBalancerSSLPorts])
+	portList := getPortSets(annotations[ServiceAnnotationLoadBalancerSSLPorts])
 	for _, port := range apiService.Spec.Ports {
 		if port.Protocol != v1.ProtocolTCP {
 			return nil, fmt.Errorf("Only TCP LoadBalancer is supported for AWS ELB")
@@ -3503,32 +3415,16 @@ func (c *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, apiS
 		}
 
 		if isNLB(annotations) {
-			portMapping := nlbPortMapping{
-				FrontendPort:     int64(port.Port),
-				FrontendProtocol: string(port.Protocol),
-				TrafficPort:      int64(port.NodePort),
-				TrafficProtocol:  string(port.Protocol),
-
+			v2Mappings = append(v2Mappings, nlbPortMapping{
+				FrontendPort: int64(port.Port),
+				TrafficPort:  int64(port.NodePort),
 				// if externalTrafficPolicy == "Local", we'll override the
 				// health check later
 				HealthCheckPort:     int64(port.NodePort),
 				HealthCheckProtocol: elbv2.ProtocolEnumTcp,
-			}
-
-			certificateARN := annotations[ServiceAnnotationLoadBalancerCertificate]
-			if certificateARN != "" && (sslPorts == nil || sslPorts.numbers.Has(int64(port.Port)) || sslPorts.names.Has(port.Name)) {
-				portMapping.FrontendProtocol = elbv2.ProtocolEnumTls
-				portMapping.SSLCertificateARN = certificateARN
-				portMapping.SSLPolicy = annotations[ServiceAnnotationLoadBalancerSSLNegotiationPolicy]
-
-				if backendProtocol := annotations[ServiceAnnotationLoadBalancerBEProtocol]; backendProtocol == "ssl" {
-					portMapping.TrafficProtocol = elbv2.ProtocolEnumTls
-				}
-			}
-
-			v2Mappings = append(v2Mappings, portMapping)
+			})
 		}
-		listener, err := buildListener(port, annotations, sslPorts)
+		listener, err := buildListener(port, annotations, portList)
 		if err != nil {
 			return nil, err
 		}
@@ -3608,7 +3504,7 @@ func (c *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, apiS
 			sourceRangeCidrs = append(sourceRangeCidrs, "0.0.0.0/0")
 		}
 
-		err = c.updateInstanceSecurityGroupsForNLB(loadBalancerName, instances, sourceRangeCidrs, v2Mappings)
+		err = c.updateInstanceSecurityGroupsForNLB(v2Mappings, instances, loadBalancerName, sourceRangeCidrs)
 		if err != nil {
 			klog.Warningf("Error opening ingress rules for the load balancer to the instances: %q", err)
 			return nil, err
@@ -3984,6 +3880,7 @@ func findSecurityGroupForInstance(instance *ec2.Instance, taggedSecurityGroups m
 // Return all the security groups that are tagged as being part of our cluster
 func (c *Cloud) getTaggedSecurityGroups() (map[string]*ec2.SecurityGroup, error) {
 	request := &ec2.DescribeSecurityGroupsInput{}
+	request.Filters = c.tagging.addFilters(nil)
 	groups, err := c.ec2.DescribeSecurityGroups(request)
 	if err != nil {
 		return nil, fmt.Errorf("error querying security groups: %q", err)
@@ -4032,9 +3929,10 @@ func (c *Cloud) updateInstanceSecurityGroupsForLoadBalancer(lb *elb.LoadBalancer
 	var actualGroups []*ec2.SecurityGroup
 	{
 		describeRequest := &ec2.DescribeSecurityGroupsInput{}
-		describeRequest.Filters = []*ec2.Filter{
+		filters := []*ec2.Filter{
 			newEc2Filter("ip-permission.group-id", loadBalancerSecurityGroupID),
 		}
+		describeRequest.Filters = c.tagging.addFilters(filters)
 		response, err := c.ec2.DescribeSecurityGroups(describeRequest)
 		if err != nil {
 			return fmt.Errorf("error querying security groups for ELB: %q", err)
@@ -4187,7 +4085,100 @@ func (c *Cloud) EnsureLoadBalancerDeleted(ctx context.Context, clusterName strin
 			}
 		}
 
-		return c.updateInstanceSecurityGroupsForNLB(loadBalancerName, nil, nil, nil)
+		{
+			var matchingGroups []*ec2.SecurityGroup
+			{
+				// Server side filter
+				describeRequest := &ec2.DescribeSecurityGroupsInput{}
+				filters := []*ec2.Filter{
+					newEc2Filter("ip-permission.protocol", "tcp"),
+				}
+				describeRequest.Filters = c.tagging.addFilters(filters)
+				response, err := c.ec2.DescribeSecurityGroups(describeRequest)
+				if err != nil {
+					return fmt.Errorf("Error querying security groups for NLB: %q", err)
+				}
+				for _, sg := range response {
+					if !c.tagging.hasClusterTag(sg.Tags) {
+						continue
+					}
+					matchingGroups = append(matchingGroups, sg)
+				}
+
+				// client-side filter out groups that don't have IP Rules we've
+				// annotated for this service
+				matchingGroups = filterForIPRangeDescription(matchingGroups, loadBalancerName)
+			}
+
+			{
+				clientRule := fmt.Sprintf("%s=%s", NLBClientRuleDescription, loadBalancerName)
+				mtuRule := fmt.Sprintf("%s=%s", NLBMtuDiscoveryRuleDescription, loadBalancerName)
+				healthRule := fmt.Sprintf("%s=%s", NLBHealthCheckRuleDescription, loadBalancerName)
+
+				for i := range matchingGroups {
+					removes := []*ec2.IpPermission{}
+					for j := range matchingGroups[i].IpPermissions {
+
+						v4rangesToRemove := []*ec2.IpRange{}
+						v6rangesToRemove := []*ec2.Ipv6Range{}
+
+						// Find IpPermission that contains k8s description
+						// If we removed the whole IpPermission, it could contain other non-k8s specified ranges
+						for k := range matchingGroups[i].IpPermissions[j].IpRanges {
+							description := aws.StringValue(matchingGroups[i].IpPermissions[j].IpRanges[k].Description)
+							if description == clientRule || description == mtuRule || description == healthRule {
+								v4rangesToRemove = append(v4rangesToRemove, matchingGroups[i].IpPermissions[j].IpRanges[k])
+							}
+						}
+
+						// Find IpPermission that contains k8s description
+						// If we removed the whole IpPermission, it could contain other non-k8s specified rangesk
+						for k := range matchingGroups[i].IpPermissions[j].Ipv6Ranges {
+							description := aws.StringValue(matchingGroups[i].IpPermissions[j].Ipv6Ranges[k].Description)
+							if description == clientRule || description == mtuRule || description == healthRule {
+								v6rangesToRemove = append(v6rangesToRemove, matchingGroups[i].IpPermissions[j].Ipv6Ranges[k])
+							}
+						}
+
+						// ipv4 and ipv6 removals cannot be included in the same permission
+						if len(v4rangesToRemove) > 0 {
+							// create a new *IpPermission to not accidentally remove UserIdGroupPairs
+							removedPermission := &ec2.IpPermission{
+								FromPort:   matchingGroups[i].IpPermissions[j].FromPort,
+								IpProtocol: matchingGroups[i].IpPermissions[j].IpProtocol,
+								IpRanges:   v4rangesToRemove,
+								ToPort:     matchingGroups[i].IpPermissions[j].ToPort,
+							}
+							removes = append(removes, removedPermission)
+						}
+						if len(v6rangesToRemove) > 0 {
+							// create a new *IpPermission to not accidentally remove UserIdGroupPairs
+							removedPermission := &ec2.IpPermission{
+								FromPort:   matchingGroups[i].IpPermissions[j].FromPort,
+								IpProtocol: matchingGroups[i].IpPermissions[j].IpProtocol,
+								Ipv6Ranges: v6rangesToRemove,
+								ToPort:     matchingGroups[i].IpPermissions[j].ToPort,
+							}
+							removes = append(removes, removedPermission)
+						}
+
+					}
+					if len(removes) > 0 {
+						changed, err := c.removeSecurityGroupIngress(aws.StringValue(matchingGroups[i].GroupId), removes)
+						if err != nil {
+							return err
+						}
+						if !changed {
+							klog.Warning("Revoking ingress was not needed; concurrent change? groupId=", *matchingGroups[i].GroupId)
+						}
+					}
+
+				}
+
+			}
+
+		}
+		return nil
 	}
 
 	lb, err := c.describeLoadBalancer(loadBalancerName)
@@ -4230,9 +4221,10 @@ func (c *Cloud) EnsureLoadBalancerDeleted(ctx context.Context, clusterName strin
 		var loadBalancerSGs = aws.StringValueSlice(lb.SecurityGroups)
 
 		describeRequest := &ec2.DescribeSecurityGroupsInput{}
-		describeRequest.Filters = []*ec2.Filter{
+		filters := []*ec2.Filter{
 			newEc2Filter("group-id", loadBalancerSGs...),
 		}
+		describeRequest.Filters = c.tagging.addFilters(filters)
 		response, err := c.ec2.DescribeSecurityGroups(describeRequest)
 		if err != nil {
 			return fmt.Errorf("error querying security groups for ELB: %q", err)
@@ -4416,12 +4408,10 @@ func (c *Cloud) getInstancesByNodeNames(nodeNames []string, states ...string) ([
 		}
 
 		nameSlice := names[i:end]
-
 		nodeFilterKey := aws.String("private-dns-name")
 		if c.cfg.Global.ExplicitNodeNames {
 			nodeFilterKey = aws.String(fmt.Sprintf("tag:%s", TagNameKubernetesNodeNamePrefix))
 		}
-
 		nodeNameFilter := &ec2.Filter{
 			Name:   nodeFilterKey,
 			Values: nameSlice,
@@ -4449,6 +4439,7 @@ func (c *Cloud) getInstancesByNodeNames(nodeNames []string, states ...string) ([
 
 // TODO: Move to instanceCache
 func (c *Cloud) describeInstances(filters []*ec2.Filter) ([]*ec2.Instance, error) {
+	filters = c.tagging.addFilters(filters)
 	request := &ec2.DescribeInstancesInput{
 		Filters: filters,
 	}
